@@ -1,0 +1,12 @@
+node_modules/
+android/
+ios/
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.iml
+local.properties
+.gradle/
+build/
+dist/

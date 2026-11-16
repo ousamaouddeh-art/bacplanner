@@ -1,0 +1,65 @@
+name: Build signed APK
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Setup Python (for icons)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow and generate Android icons
+        run: |
+          pip install pillow
+          python3 scripts/gen-icons.py
+
+      - name: Add Capacitor Android platform
+        run: npx cap add android
+
+      - name: Sync web assets
+        run: npx cap sync
+
+      - name: Patch manifest, signing, and icons
+        run: node scripts/prepare-android.js
+
+      - name: Assemble signed release APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bacplanner-apk
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
