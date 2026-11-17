@@ -1,99 +1,70 @@
-// اختبار شامل للواجهة بمتصفح بحجم جوال. التشغيل: node tests/ui.test.js [مجلد_الصور]
-const { chromium } = require('/opt/npm-tools/node_modules/playwright');
-const out = process.argv[2] || '/tmp/shots';
-const URL = process.env.APP_URL || 'http://localhost:8123/';
-const log = (...a) => console.log(...a);
-(async () => {
-  const browser = await chromium.launch();
-  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1, locale: 'ar', timezoneId: 'Asia/Damascus' });
-  const page = await ctx.newPage();
-  const errors = [];
-  page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
-  page.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
-  await page.clock.setFixedTime(new Date('2026-11-11T17:10:00+03:00'));
-  const shot = (n) => page.screenshot({ path: `${out}/${n}.png` });
-  const click = (sel) => page.click(sel);
-  const text = (t) => page.getByText(t, { exact: false });
-
-  await page.goto(URL);
-  await page.waitForSelector('.welcome');
-  await shot('01-welcome');
-  await click('[data-act=preset][data-min="180"]');
-  await click('[data-act=new-subject]');
-  await page.waitForSelector('#f-name');
-  await page.fill('#f-name', 'الرياضيات');
-  await click('[data-act=set][data-field=mode][data-val=teacher]');
-  for (let i = 0; i < 2; i++) await click('[data-act=step][data-field=lessonMin][data-dir="1"]'); // 60 -> 90
-  for (let i = 0; i < 3; i++) await click('[data-act=step][data-field=backlog][data-dir="1"]');   // 5 -> 8
-  await shot('02-form');
-  await click('[data-act=save-subject]');
-  await page.waitForSelector('.daysum');
-  await shot('03-today');
-
-  // مادة ثانية: ذاتية، أهمية عالية
-  await click('#tabs a[data-to=subjects]');
-  await click('[data-act=new-subject]');
-  await page.fill('#f-name', 'الفيزياء');
-  await click('[data-act=set][data-field=importance][data-val="3"]');
-  for (let i = 0; i < 7; i++) await click('[data-act=step][data-field=backlog][data-dir="1"]'); // 12
-  await click('[data-act=save-subject]');
-  await page.waitForSelector('.subj');
-  await shot('04-subjects');
-
-  await click('#tabs a[data-to=schedule]');
-  await page.waitForSelector('.dchip');
-  await shot('05-schedule');
-
-  // تفاصيل مادة
-  await click('#tabs a[data-to=subjects]');
-  await click('.subj >> nth=0');
-  await page.waitForSelector('.lrow');
-  await shot('06-subject');
-  await page.goBack();
-
-  // إنجاز جلسة اليوم
-  await click('#tabs a[data-to=today]');
-  await page.waitForSelector('.daysum');
-  const hasRows = await page.locator('.srow').count();
-  log('today rows:', hasRows);
-  if (hasRows) {
-    await click('.srow .chk >> nth=0');
-    await shot('07-after-toggle');
+// Starts a local server and tests the real UI. No machine-specific paths.
+const test = require('node:test'), assert = require('node:assert/strict');
+const fs = require('node:fs'), http = require('node:http'), path = require('node:path');
+const { once } = require('node:events');
+const { chromium } = require('playwright');
+const root = path.resolve(__dirname, '../www');
+test('تدفق المتصفح والحفظ والاسترجاع', { timeout: 120000 }, async () => {
+  const server = http.createServer((req, res) => {
+    let file;
+    try {
+      const name = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+      file = path.resolve(root, '.' + (name === '/' ? '/index.html' : name));
+      if (!file.startsWith(root + path.sep)) throw new Error('outside root');
+    } catch { res.writeHead(400); res.end(); return; }
+    const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png' };
+    fs.readFile(file, (err, data) => {
+      if (err) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { 'Content-Type': types[path.extname(file)] || 'application/octet-stream' }); res.end(data);
+    });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  let browser;
+  try {
+    browser = await chromium.launch();
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, locale: 'ar', timezoneId: 'Asia/Damascus', acceptDownloads: true });
+    const page = await ctx.newPage(), errors = [];
+    page.on('pageerror', e => errors.push(e.message));
+    page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
+    await page.clock.setFixedTime(new Date('2026-11-11T12:00:00+03:00'));
+    await page.goto('http://127.0.0.1:' + server.address().port);
+    await page.waitForSelector('.welcome'); await page.click('[data-act="new-subject"]');
+    await page.fill('#f-name', 'الرياضيات'); await page.fill('#f-deadline', ''); await page.click('[data-act="save-subject"]');
+    assert.equal(await page.evaluate(() => window.__bac.state.subjects.length), 0);
+    await page.fill('#f-deadline', '2027-01-10'); await page.click('[data-act="save-subject"]');
+    await page.waitForSelector('.srow');
+    assert.equal(await page.evaluate(() => window.__bac.state.subjects.length), 1);
+    const first = page.locator('.srow .chk[data-act="toggle"]').first(), id = await first.getAttribute('data-id');
+    await first.click(); await page.waitForSelector('#s-note'); await page.fill('#s-note', 'مراجعة قوانين الدرس');
+    await page.click('[data-act="save-note"]'); await page.waitForSelector('[data-act="difficulty"]');
+    await page.click('[data-act="difficulty"][data-diff="hard"]'); await page.waitForSelector('.sheet', { state: 'detached' });
+    const lesson = await page.evaluate(id => {
+      const s = window.__bac.state, session = s.sessions.find(x => x.id === id);
+      return s.subjects[0].lessons.find(x => x.id === session.lessonId);
+    }, id);
+    assert.equal(lesson.done, true); assert.equal(lesson.review.min, 60); assert.equal(lesson.review.doneMin, 0);
+    assert.equal(lesson.memo, 'مراجعة قوانين الدرس');
+    await page.reload(); await page.waitForSelector('.daysum');
+    assert.equal(await page.evaluate(() => window.__bac.state.subjects[0].lessons.filter(x => x.done).length), 1);
+    for (const tab of ['subjects', 'schedule', 'report', 'settings']) {
+      await page.click('#tabs [data-to="' + tab + '"]'); await page.waitForTimeout(80);
+      assert.ok(await page.locator('#app').innerText());
+      for (const width of [360, 1024]) {
+        await page.setViewportSize({ width, height: 844 });
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true, 'overflow: ' + tab);
+      }
+    }
+    const downloading = page.waitForEvent('download'); await page.click('[data-act="export-data"]');
+    const download = await downloading, exported = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
+    assert.equal(exported.subjects.length, 1);
+    await page.click('[data-act="reset"]'); await page.click('[data-act="do-reset"]'); await page.waitForSelector('.welcome');
+    await page.evaluate(() => { location.hash = '#/settings'; }); await page.waitForSelector('#import-data');
+    await page.setInputFiles('#import-data', { name: 'backup.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(exported)) });
+    await page.click('[data-act="confirm-import"]'); await page.waitForSelector('.daysum');
+    assert.equal(await page.evaluate(() => window.__bac.state.subjects[0].lessons[0].memo), lesson.memo);
+    assert.deepEqual(errors, [], 'browser errors'); await ctx.close();
+  } finally {
+    if (browser) await browser.close();
+    await new Promise(resolve => server.close(resolve));
   }
-  const sheet = await page.locator('.sheet').count();
-  log('difficulty sheet shown:', sheet);
-  if (sheet) { await shot('08-sheet'); }
-
-  await click('#tabs a[data-to=report]');
-  await page.waitForSelector('.weeknav');
-  await shot('09-report');
-  await click('#tabs a[data-to=settings]');
-  await page.waitForSelector('.setrow');
-  await shot('10-settings');
-
-  // مادة مستحيلة: موعد قريب جداً
-  await click('#tabs a[data-to=subjects]');
-  await click('[data-act=new-subject]');
-  await page.fill('#f-name', 'الكيمياء');
-  for (let i = 0; i < 20; i++) await click('[data-act=step][data-field=backlog][data-dir="1"]');
-  await page.fill('#f-deadline', '2026-11-18');
-  await page.dispatchEvent('#f-deadline', 'input');
-  await shot('11-form-infeasible');
-  await click('[data-act=save-subject]');
-  await page.waitForSelector('.sheet');
-  await page.waitForTimeout(400);
-  await shot('12-options');
-  await click('.sheet [data-act=apply-extend]');
-  await page.waitForTimeout(400);
-  await click('#tabs a[data-to=today]');
-  await shot('13-today-final');
-
-  // استمرار البيانات بعد إعادة التحميل
-  await page.reload();
-  await page.waitForSelector('.daysum');
-  const subjectsAfter = await page.evaluate(() => window.__bac.state.subjects.length);
-  log('subjects after reload:', subjectsAfter);
-
-  log('ERRORS:', errors.length ? errors : 'none');
-  await browser.close();
-})().catch((e) => { console.error('TEST FAILED', e); process.exit(1); });
+});

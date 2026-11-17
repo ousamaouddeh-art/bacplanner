@@ -186,12 +186,15 @@ test('إنجاز جلسة يكمل الدرس، واختيار «صعب» يضي
   const st = mkState();
   const sub = addSub(st, { backlog: 2, lessonMin: 60 });
   let s = E.replan(st, NOW).state;
-  const first = s.sessions.filter((x) => x.kind === 'study').sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start))[0];
+  const first = s.sessions.filter((x) => x.kind === 'study').sort((a, b) => a.date.localeCompare(b.date) || a.start - b.start)[0];
   const res = E.completeSession(s, first.id, NOW);
   assert.equal(res.lessonCompleted, true);
   E.setDifficulty(s, sub.id, res.lessonId, 'hard');
   const l = E.findLesson(s.subjects[0], res.lessonId);
-  assert.deepEqual(l.review, { min: 60, status: 'pending' });
+  assert.equal(l.review.min, 60);
+  assert.equal(l.review.doneMin, 0);
+  assert.equal(l.review.status, 'pending');
+  assert.equal(typeof l.review.cycle, 'string');
   s = E.replan(s, NOW).state;
   const rev = s.sessions.filter((x) => x.kind === 'review' && x.lessonId === res.lessonId);
   assert.equal(sum(rev), 60);

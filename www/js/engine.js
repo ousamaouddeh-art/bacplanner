@@ -17,8 +17,12 @@
   /* ============ التواريخ ============ */
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   function parseDay(s) {
-    var p = s.split('-');
-    return Math.round(Date.UTC(+p[0], +p[1] - 1, +p[2]) / DAY_MS);
+    if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return NaN;
+    var p = s.split('-'), y = +p[0], m = +p[1], day = +p[2];
+    if (y < 1000 || m < 1 || m > 12 || day < 1 || day > 31) return NaN;
+    var stamp = Date.UTC(y, m - 1, day), d = new Date(stamp);
+    if (d.getUTCFullYear() !== y || d.getUTCMonth() !== m - 1 || d.getUTCDate() !== day) return NaN;
+    return Math.round(stamp / DAY_MS);
   }
   function fmtDay(n) {
     var d = new Date(n * DAY_MS);
@@ -108,6 +112,80 @@
     return { version: 1, settings: defaultSettings(), subjects: [], sessions: [], meta: { finish: {}, counter: 0 } };
   }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function normalizeState(input) {
+    if (!input || input.version !== 1 || !Array.isArray(input.subjects)) throw new Error('INVALID_STATE');
+    var st = clone(input), defaults = defaultSettings(), migrated = !st.meta || st.meta.repairRevision !== 2;
+    if (!st.settings || typeof st.settings !== 'object' || Array.isArray(st.settings)) st.settings = {};
+    function num(v, fallback, low, high) {
+      return typeof v === 'number' && isFinite(v) ? Math.max(low, Math.min(high, Math.round(v))) : fallback;
+    }
+    st.settings.dayMin = Array.isArray(st.settings.dayMin) && st.settings.dayMin.length === 7 ? st.settings.dayMin.map(function (v, i) { return num(v, defaults.dayMin[i], 0, 720); }) : defaults.dayMin;
+    Object.keys(defaults).forEach(function (key) {
+      if (key !== 'dayMin') st.settings[key] = num(st.settings[key], defaults[key], key === 'maxSession' || key === 'reviewEasyMin' || key === 'reviewHardMin' ? 15 : 0, key === 'startMin' ? 1200 : 720);
+    });
+    if (st.sessions == null) st.sessions = [];
+    if (!Array.isArray(st.sessions)) throw new Error('INVALID_SESSIONS');
+    if (!st.meta || typeof st.meta !== 'object' || Array.isArray(st.meta)) st.meta = {};
+    if (!st.meta.finish || typeof st.meta.finish !== 'object') st.meta.finish = {};
+    var subs = {}, ids = {};
+    function safeId(id) { return typeof id === 'string' && /^[a-zA-Z0-9_-]{1,100}$/.test(id) && id !== '__proto__' && id !== 'constructor' && id !== 'prototype'; }
+    st.subjects.forEach(function (sub) {
+      if (!sub || !safeId(sub.id) || ids[sub.id] || typeof sub.name !== 'string' || !isFinite(parseDay(sub.deadline)) || !Array.isArray(sub.lessons)) throw new Error('INVALID_SUBJECT');
+      ids[sub.id] = true; subs[sub.id] = sub;
+      sub.lessonMin = num(sub.lessonMin, 60, 15, 360);
+      sub.importance = num(sub.importance, 2, 1, 3);
+      sub.teacherPerWeek = num(sub.teacherPerWeek, 0, 0, 14);
+      sub.mode = sub.mode === 'teacher' ? 'teacher' : 'self';
+      if (sub.archivedLessons == null) sub.archivedLessons = [];
+      if (!Array.isArray(sub.archivedLessons)) throw new Error('INVALID_LESSONS');
+      sub.lessons.concat(sub.archivedLessons).forEach(function (l) {
+        if (!l || !safeId(l.id) || ids[l.id] || typeof l.title !== 'string') throw new Error('INVALID_LESSON');
+        ids[l.id] = true;
+        l.min = num(l.min, sub.lessonMin, 15, 360);
+        l.doneMin = num(l.doneMin, l.done ? l.min : 0, 0, l.min);
+        l.done = !!l.done || l.doneMin >= l.min;
+        if (l.done) l.doneMin = l.min;
+        l.doneDate = isFinite(parseDay(l.doneDate)) ? l.doneDate : null;
+        if (l.availableFrom && !isFinite(parseDay(l.availableFrom))) throw new Error('INVALID_RELEASE');
+        if (l.done && !l.archived && !l.review) ensureReview(l, st.settings);
+        if (l.review) {
+          if (typeof l.review !== 'object') throw new Error('INVALID_REVIEW');
+          var r = l.review, legacy = typeof r.doneMin !== 'number';
+          r.min = num(r.min, reviewMinFor(l, st.settings), 15, 720);
+          if (!r.cycle || !safeId(r.cycle)) r.cycle = uid();
+          if (legacy) {
+            var done = 0, pending = false;
+            st.sessions.forEach(function (x) {
+              if (x && x.lessonId === l.id && x.kind === 'review') {
+                if (x.status === 'pending') pending = true;
+                if (x.status === 'done') done += num(x.minutes, 0, 0, 720);
+              }
+            });
+            r.doneMin = r.status === 'done' && !pending ? r.min : Math.min(r.min, done);
+          }
+          r.doneMin = num(r.doneMin, 0, 0, r.min);
+          r.status = r.doneMin >= r.min ? 'done' : 'pending';
+        }
+      });
+      sub.archivedLessons.forEach(function (l) { l.archived = true; });
+    });
+    st.sessions.forEach(function (x) {
+      if (!x || !safeId(x.id) || ids[x.id] || !subs[x.subjectId] || !safeId(x.lessonId) || !isFinite(parseDay(x.date)) || ['pending','done','missed'].indexOf(x.status) === -1 || ['study','review'].indexOf(x.kind) === -1 || typeof x.minutes !== 'number' || !isFinite(x.minutes) || x.minutes <= 0 || typeof x.start !== 'number' || !isFinite(x.start)) throw new Error('INVALID_SESSION');
+      ids[x.id] = true;
+      var sub = subs[x.subjectId], l = findLesson(sub, x.lessonId);
+      if (!l) {
+        l = { id: x.lessonId, title: x.lessonTitle || 'درس محذوف', min: x.minutes, doneMin: 0, done: false, doneDate: null, archived: true, review: null };
+        sub.archivedLessons.push(l);
+      }
+      if (x.status === 'done' && (typeof x.doneDay !== 'number' || !isFinite(x.doneDay))) x.doneDay = parseDay(x.date);
+      if (x.kind === 'review' && l.review && !x.reviewCycle) x.reviewCycle = l.review.cycle;
+    });
+    st.sessions = st.sessions.filter(function (x) { var l = findLesson(subs[x.subjectId], x.lessonId); return !(l.archived && x.status === 'pending'); });
+    st.meta.repairRevision = 2;
+    if (migrated) delete st.meta.lastPlanDay;
+    return st;
+  }
+
   var uidCounter = 0;
   function uid() {
     uidCounter++;
@@ -151,6 +229,12 @@
       ws += 7;
     }
   }
+  function archiveLesson(sub, lesson, reason) {
+    sub.archivedLessons = sub.archivedLessons || [];
+    if (!sub.archivedLessons.some(function (x) { return x.id === lesson.id; })) {
+      lesson.archived = true; lesson.archiveReason = reason || 'removed'; sub.archivedLessons.push(lesson);
+    }
+  }
   function pendingBacklog(sub) {
     return sub.lessons.filter(function (l) { return l.source !== 'teacher' && isUnstarted(l); });
   }
@@ -161,18 +245,42 @@
       for (var i = cur.length; i < n; i++) addLesson(sub, { source: 'backlog' });
     } else if (n < cur.length) {
       var drop = cur.slice(n).map(function (l) { return l.id; });
-      sub.lessons = sub.lessons.filter(function (l) { return drop.indexOf(l.id) === -1; });
+      sub.lessons = sub.lessons.filter(function (l) {
+        if (drop.indexOf(l.id) !== -1) { archiveLesson(sub, l); return false; }
+        return true;
+      });
     }
   }
   function rebuildTeacherLessons(sub, today) {
-    sub.lessons = sub.lessons.filter(function (l) { return !(l.source === 'teacher' && isUnstarted(l)); });
-    addTeacherLessons(sub, today);
+    // Past arrivals and started/customized future lessons keep their identity.
+    var next = [], used = {}, dl = parseDay(sub.deadline);
+    sub.lessons.forEach(function (l) {
+      if (l.source !== 'teacher' || !l.availableFrom || parseDay(l.availableFrom) <= today || !isUnstarted(l) || l.customized || l.memo) {
+        next.push(l);
+        if (l.source === 'teacher' && l.availableFrom) used[l.availableFrom] = (used[l.availableFrom] || 0) + 1;
+      }
+    });
+    (sub.archivedLessons || []).forEach(function (l) {
+      if (l.source === 'teacher' && l.availableFrom && l.archiveReason !== 'schedule-change') used[l.availableFrom] = (used[l.availableFrom] || 0) + 1;
+    });
+    var old = sub.lessons;
+    sub.lessons = next;
+    if (sub.mode !== 'teacher') { old.forEach(function (l) { if (next.indexOf(l) === -1) archiveLesson(sub, l, 'schedule-change'); }); return; }
+    for (var ws = weekStart(today) + 7, guard = 0; ws <= dl - 2 && guard++ < 80; ws += 7) {
+      var date = fmtDay(ws), slots = Math.max(0, sub.teacherPerWeek - (used[date] || 0));
+      var pool = old.filter(function (l) { return l.source === 'teacher' && l.availableFrom === date && next.indexOf(l) === -1; });
+      for (var i = 0; i < slots; i++) {
+        if (pool[i]) sub.lessons.push(pool[i]);
+        else addLesson(sub, { source: 'teacher', availableFrom: date });
+      }
+    }
+    old.forEach(function (l) { if (sub.lessons.indexOf(l) === -1) archiveLesson(sub, l, 'schedule-change'); });
   }
   // يحذف آخر n دروس لم تبدأ (خيار «تقليل الدروس»)
   function dropLastLessons(sub, n) {
     var removed = 0;
     for (var i = sub.lessons.length - 1; i >= 0 && removed < n; i--) {
-      if (isUnstarted(sub.lessons[i])) { sub.lessons.splice(i, 1); removed++; }
+      if (isUnstarted(sub.lessons[i])) { archiveLesson(sub, sub.lessons[i]); sub.lessons.splice(i, 1); removed++; }
     }
     return removed;
   }
@@ -194,6 +302,7 @@
   }
   // تعديل بيانات المادة (الأسماء والأرقام) مع الحفاظ على الدروس التي بدأت
   function updateSubject(sub, input, today) {
+    var oldMode = sub.mode, oldRate = sub.teacherPerWeek, oldDeadline = sub.deadline;
     sub.name = String(input.name || sub.name).trim();
     sub.importance = input.importance || sub.importance;
     sub.mode = input.mode === 'self' ? 'self' : 'teacher';
@@ -204,7 +313,7 @@
       sub.lessons.forEach(function (l) { if (isUnstarted(l)) l.min = sub.lessonMin; });
     }
     if (typeof input.backlog === 'number') setBacklog(sub, input.backlog);
-    rebuildTeacherLessons(sub, today);
+    if (input.mode !== oldMode || sub.teacherPerWeek !== oldRate || sub.deadline !== oldDeadline) rebuildTeacherLessons(sub, today);
   }
 
   /* ============ المحاكاة (قلب المحرك) ============ */
@@ -212,13 +321,9 @@
     var base = S.dayMin[dow(day)] || 0;
     if (base <= 0) return 0;
     base += extra || 0;
-    var cap;
-    if (day === now.day) {
-      if (now.min > S.startMin) cap = Math.max(0, S.startMin + base - now.min);
-      else cap = Math.max(0, base - (doneByDay[day] || 0));
-    } else cap = base;
     var cursor = day === now.day ? Math.max(roundUp(now.min, 5), S.startMin) : S.startMin;
-    return Math.max(0, Math.min(cap, 1439 - cursor));
+    var end = Math.min(1440, S.startMin + base);
+    return Math.max(0, Math.min(base - (doneByDay[day] || 0), end - cursor));
   }
   function roundUp(x, step) { return Math.ceil(x / step) * step; }
 
@@ -232,9 +337,9 @@
           release: l.availableFrom ? Math.max(today, parseDay(l.availableFrom)) : today
         });
       }
-      if (l.review && l.review.status === 'pending') {
+      if (l.done && l.review && l.review.status === 'pending') {
         units.push({
-          type: 'review', lessonId: l.id, rem: l.review.min, order: i,
+          type: 'review', lessonId: l.id, rem: Math.max(0, l.review.min - (l.review.doneMin || 0)), reviewCycle: l.review.cycle, order: i,
           release: Math.max(today, l.doneDate ? parseDay(l.doneDate) + 1 : today)
         });
       }
@@ -274,7 +379,7 @@
     var doneByDay = {};
     state.sessions.forEach(function (s) {
       if (s.status === 'done') {
-        var d = parseDay(s.date);
+        var d = typeof s.doneDay === 'number' ? s.doneDay : parseDay(s.date);
         doneByDay[d] = (doneByDay[d] || 0) + s.minutes;
       }
     });
@@ -318,6 +423,12 @@
       var cap = caps[day - today];
       if (cap <= 0) continue;
       var cursor = day === today ? Math.max(roundUp(now.min, 5), S.startMin) : S.startMin;
+      var windowEnd = Math.min(1440, S.startMin + (S.dayMin[dow(day)] || 0) + extra);
+      state.sessions.forEach(function (done) {
+        var doneDay = typeof done.doneDay === 'number' ? done.doneDay : parseDay(done.date);
+        if (done.status === 'done' && doneDay === day && parseDay(done.date) === day) cursor = Math.max(cursor, done.start + done.minutes + S.breakMin);
+      });
+      cap = Math.min(cap, Math.max(0, windowEnd - cursor));
       subs.forEach(function (x) {
         x.assigned = 0;
         var rem = remainingTotal(x, S);
@@ -395,9 +506,9 @@
 
         sessions.push({
           id: uid(), subjectId: pick.s.id, lessonId: u.lessonId, kind: u.type,
-          date: fmtDay(day), start: cursor, minutes: chunk, status: 'pending'
+          date: fmtDay(day), start: cursor, minutes: chunk, status: 'pending', reviewCycle: u.reviewCycle || null
         });
-        u.rem -= chunk; cap -= chunk; cursor += chunk + S.breakMin;
+        u.rem -= chunk; cursor += chunk + S.breakMin; cap = Math.max(0, Math.min(cap - chunk, windowEnd - cursor));
         pick.assigned += chunk; pick.plannedMin += chunk; pick.lastDay = day;
 
         if (pick.s.id === lastSubId) {
@@ -609,7 +720,8 @@
   }
   function findLesson(sub, id) {
     if (!sub) return null;
-    for (var i = 0; i < sub.lessons.length; i++) if (sub.lessons[i].id === id) return sub.lessons[i];
+    var all = sub.lessons.concat(sub.archivedLessons || []);
+    for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i];
     return null;
   }
   function findSession(state, id) {
@@ -617,65 +729,111 @@
     return null;
   }
 
+  function ensureReview(lesson, settings) {
+    if (!lesson.review) lesson.review = { min: reviewMinFor(lesson, settings), doneMin: 0, status: 'pending', cycle: uid() };
+    if (!lesson.review.cycle) lesson.review.cycle = uid();
+    if (typeof lesson.review.doneMin !== 'number') lesson.review.doneMin = lesson.review.status === 'done' ? lesson.review.min : 0;
+    return lesson.review;
+  }
   function completeSession(state, id, now) {
-    var s = findSession(state, id);
-    var out = { lessonCompleted: false };
-    if (!s || s.status === 'done') return out;
-    s.status = 'done'; s.doneDay = now.day;
+    var s = findSession(state, id), out = { lessonCompleted: false };
+    if (!s || s.status !== 'pending') return out;
     var sub = findSubject(state, s.subjectId), l = findLesson(sub, s.lessonId);
-    if (!l) return out;
+    if (!l || l.archived || (s.kind === 'review' && !l.done)) return out;
+    if (s.kind === 'review' && l.review && s.reviewCycle && s.reviewCycle !== l.review.cycle) return out;
+    s.status = 'done'; s.doneDay = now.day;
     if (s.kind === 'study') {
-      l.doneMin = (l.doneMin || 0) + s.minutes;
+      l.doneMin = Math.min(l.min, (l.doneMin || 0) + s.minutes);
       if (l.doneMin >= l.min && !l.done) {
         l.done = true; l.doneDate = fmtDay(now.day);
+        ensureReview(l, state.settings);
         out.lessonCompleted = true; out.subjectId = sub.id; out.lessonId = l.id;
       }
-    } else if (l.review) l.review.status = 'done';
-    else l.review = { min: s.minutes, status: 'done' };
+    } else {
+      var r = ensureReview(l, state.settings);
+      s.reviewCycle = r.cycle;
+      r.doneMin = Math.min(r.min, r.doneMin + s.minutes);
+      r.status = r.doneMin >= r.min ? 'done' : 'pending';
+    }
     numberParts(state);
     return out;
   }
   function undoSession(state, id) {
     var s = findSession(state, id);
-    if (!s || s.status !== 'done') return;
-    s.status = 'pending'; delete s.doneDay;
+    if (!s || s.status !== 'done') return false;
     var sub = findSubject(state, s.subjectId), l = findLesson(sub, s.lessonId);
-    if (!l) return;
-    if (s.kind === 'study') {
+    if (!l || l.archived || s.historyOnly) return false;
+    if (s.kind === 'review') {
+      if (!l.review || (s.reviewCycle && s.reviewCycle !== l.review.cycle)) return false;
+      ensureReview(l, state.settings);
+      l.review.doneMin = Math.max(0, l.review.doneMin - s.minutes);
+      l.review.status = 'pending';
+    } else {
       l.doneMin = Math.max(0, (l.doneMin || 0) - s.minutes);
-      if (l.done && l.doneMin < l.min) {
-        l.done = false; l.doneDate = null;
-        if (l.review && l.review.status === 'pending') l.review = null;
-      }
-    } else if (l.review) l.review.status = 'pending';
+      if (l.doneMin < l.min) { l.done = false; l.doneDate = null; l.review = null; }
+      // A review cannot remain actionable before its study is complete.
+      state.sessions = state.sessions.filter(function (x) {
+        return !(x.lessonId === l.id && x.kind === 'review' && x.status === 'pending');
+      });
+    }
+    s.status = 'pending'; delete s.doneDay;
+    return true;
   }
   function skipSession(state, id) {
     var s = findSession(state, id);
     if (s && s.status === 'pending') s.status = 'missed';
     numberParts(state);
   }
-
-  // اختيار صعوبة الدرس بعد إنجازه يحدد مدة المراجعة (صعب: ساعة، غيره: نصف ساعة)
   function setDifficulty(state, subjectId, lessonId, diff) {
     var sub = findSubject(state, subjectId), l = findLesson(sub, lessonId);
-    if (!l) return;
+    if (!l || l.archived || ['easy', 'medium', 'hard'].indexOf(diff) === -1) return;
     l.difficulty = diff;
-    var min = diff === 'hard' ? state.settings.reviewHardMin : state.settings.reviewEasyMin;
-    if (!l.review || l.review.status !== 'done') l.review = { min: min, status: 'pending' };
+    if (!l.done) return;
+    var r = ensureReview(l, state.settings);
+    if (r.status !== 'done') {
+      r.min = reviewMinFor(l, state.settings);
+      r.doneMin = Math.min(r.min, r.doneMin);
+      r.status = r.doneMin >= r.min ? 'done' : 'pending';
+    }
   }
   function setLessonDone(state, subjectId, lessonId, flag, now) {
     var sub = findSubject(state, subjectId), l = findLesson(sub, lessonId);
-    if (!l) return;
-    if (flag) { l.done = true; l.doneMin = l.min; l.doneDate = fmtDay(now.day); }
-    else { l.done = false; l.doneMin = 0; l.doneDate = null; l.review = null; }
+    if (!l || l.archived) return;
+    if (flag) {
+      l.done = true; l.doneMin = l.min; l.doneDate = fmtDay(now.day);
+      ensureReview(l, state.settings);
+    } else {
+      l.done = false; l.doneMin = 0; l.doneDate = null; l.review = null;
+      // Previous study records remain history, not undoable work in this cycle.
+      state.sessions.forEach(function (x) { if (x.lessonId === lessonId && x.status === 'done') x.historyOnly = true; });
+    }
   }
-  // إعادة درس منجز للمراجعة (حسب رغبة الطالب)
   function requestReview(state, subjectId, lessonId, diff) {
     var sub = findSubject(state, subjectId), l = findLesson(sub, lessonId);
-    if (!l) return;
+    if (!l || l.archived || !l.done || ['easy', 'medium', 'hard'].indexOf(diff) === -1) return;
     l.difficulty = diff;
-    l.review = { min: diff === 'hard' ? state.settings.reviewHardMin : state.settings.reviewEasyMin, status: 'pending' };
-    if (!l.doneDate) l.doneDate = null;
+    l.review = { min: reviewMinFor(l, state.settings), doneMin: 0, status: 'pending', cycle: uid() };
+  }
+  function setLessonDuration(state, subjectId, lessonId, minutes) {
+    var sub = findSubject(state, subjectId), l = findLesson(sub, lessonId);
+    if (!l || l.archived || l.done || typeof minutes !== 'number' || !isFinite(minutes) || minutes < Math.max(15, l.doneMin || 0) || minutes > 360) return false;
+    l.min = Math.round(minutes); l.customized = true;
+    if (l.doneMin >= l.min) {
+      l.done = true;
+      var dates = state.sessions.filter(function (x) { return x.lessonId === lessonId && x.kind === 'study' && x.status === 'done'; })
+        .map(function (x) { return typeof x.doneDay === 'number' ? x.doneDay : parseDay(x.date); });
+      l.doneDate = dates.length ? fmtDay(Math.max.apply(null, dates)) : null;
+      ensureReview(l, state.settings);
+    }
+    return true;
+  }
+  function deleteLesson(state, subjectId, lessonId) {
+    var sub = findSubject(state, subjectId), l = findLesson(sub, lessonId);
+    if (!l || l.archived) return;
+    // Non-destructive archive keeps completed/missed sessions and their labels valid.
+    archiveLesson(sub, l);
+    sub.lessons = sub.lessons.filter(function (x) { return x.id !== lessonId; });
+    state.sessions = state.sessions.filter(function (x) { return !(x.lessonId === lessonId && x.status === 'pending'); });
   }
 
   /* ============ التقرير الأسبوعي ============ */
@@ -701,7 +859,7 @@
       var cs = counted.filter(function (s) { return s.subjectId === sub.id; });
       var dMin = sum(ss, function (s) { return s.status === 'done'; });
       var cMin = sum(cs);
-      var doneLessons = sub.lessons.filter(function (l) { return l.doneDate && parseDay(l.doneDate) >= ws && parseDay(l.doneDate) < ws + 7; });
+      var doneLessons = sub.lessons.concat(sub.archivedLessons || []).filter(function (l) { return l.doneDate && parseDay(l.doneDate) >= ws && parseDay(l.doneDate) < ws + 7; });
       doneLessons.forEach(function (l) { rep.lessonsDone.push({ subjectId: sub.id, lessonId: l.id, title: l.title }); });
       var lateIds = {};
       ss.forEach(function (s) {
@@ -748,7 +906,7 @@
     fmtDur: fmtDur, fmtTime: fmtTime, fmtDate: fmtDate, fmtDateShort: fmtDateShort, relDay: relDay,
     fmtLessons: fmtLessons, fmtDays: fmtDays, plural: plural, DAY_NAMES: DAY_NAMES, MONTHS: MONTHS,
     // الحالة
-    newState: newState, defaultSettings: defaultSettings, clone: clone,
+    newState: newState, defaultSettings: defaultSettings, clone: clone, normalizeState: normalizeState,
     // المواد والدروس
     createSubject: createSubject, updateSubject: updateSubject, addLesson: addLesson,
     pendingBacklog: pendingBacklog, setBacklog: setBacklog, dropLastLessons: dropLastLessons, subjectProgress: subjectProgress,
@@ -757,7 +915,7 @@
     simulate: simulate, analyze: analyze, replan: replan, needsReplan: needsReplan, numberParts: numberParts,
     // التنفيذ
     completeSession: completeSession, undoSession: undoSession, skipSession: skipSession,
-    setDifficulty: setDifficulty, setLessonDone: setLessonDone, requestReview: requestReview,
+    setDifficulty: setDifficulty, setLessonDone: setLessonDone, requestReview: requestReview, setLessonDuration: setLessonDuration, deleteLesson: deleteLesson,
     // تقارير
     weeklyReport: weeklyReport, sessionsOn: sessionsOn
   };

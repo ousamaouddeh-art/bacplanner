@@ -4,6 +4,10 @@
 
   var E = window.Engine, N = window.Notify;
   var KEY = 'bacplanner.v1';
+  var BACKUP_KEY = KEY + '.backup';
+  var RECOVERY_KEY = KEY + '.recovery';
+  var APP_VERSION = '0.2.2';
+  var storageBlocked = false, recoveryRaw = null, importDraft = null, notifSync = null;
   var COLORS = ['#F2B705', '#2FBF8F', '#EE7B73', '#4BA3EA', '#9B7FD4', '#F28F3B', '#22AEBB', '#8FC13E'];
   var IMP = { 1: 'منخفضة', 2: 'متوسطة', 3: 'عالية' };
   var SUGGEST = ['الرياضيات', 'الفيزياء', 'الكيمياء', 'العلوم', 'اللغة العربية', 'اللغة الإنكليزية', 'اللغة الفرنسية', 'التربية الدينية'];
@@ -25,22 +29,66 @@
 
   /* ============ التخزين ============ */
   function load() {
+    var raw = null;
     try {
-      var raw = localStorage.getItem(KEY);
-      if (raw) {
-        var st = JSON.parse(raw);
-        if (st && st.version === 1 && st.settings && st.subjects) {
-          st.meta = st.meta || { finish: {} };
-          var def = E.defaultSettings();
-          Object.keys(def).forEach(function (k) { if (st.settings[k] == null) st.settings[k] = def[k]; });
-          return st;
-        }
+      raw = localStorage.getItem(KEY);
+      if (!raw) return E.newState();
+      var st = E.normalizeState(JSON.parse(raw));
+      if (JSON.stringify(st) !== raw) {
+        localStorage.setItem(BACKUP_KEY, raw);
+        if (!localStorage.getItem(RECOVERY_KEY)) localStorage.setItem(RECOVERY_KEY, raw);
       }
-    } catch (e) { memoryOnly = true; }
-    return E.newState();
+      return st;
+    } catch (e) {
+      if (raw) {
+        storageBlocked = true; recoveryRaw = raw;
+        try { if (!localStorage.getItem(RECOVERY_KEY)) localStorage.setItem(RECOVERY_KEY, raw); } catch (ignored) { /* original stays in KEY */ }
+      }
+      else memoryOnly = true;
+      return E.newState();
+    }
   }
   function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { memoryOnly = true; }
+    if (storageBlocked) return false;
+    try {
+      var raw = localStorage.getItem(KEY), next = JSON.stringify(S);
+      if (raw && raw !== next) localStorage.setItem(BACKUP_KEY, raw);
+      localStorage.setItem(KEY, next);
+      memoryOnly = false;
+      return true;
+    } catch (e) {
+      memoryOnly = true;
+      toast('تعذّر حفظ التغيير على الجهاز. صدّر نسخة احتياطية قبل الإغلاق.');
+      return false;
+    }
+  }
+  function downloadJSON(raw, filename) {
+    try {
+      var url = URL.createObjectURL(new Blob([raw], { type: 'application/json' }));
+      var a = document.createElement('a'); a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      if (N && N.isNative && N.isNative()) {
+        openSheet('<h3>نسخة البيانات</h3><p class="lead">إذا لم يبدأ التنزيل على هاتفك، اضغط مطولاً داخل النص لنسخه واحفظه كاملاً في ملف JSON خارج التطبيق.</p>' +
+          '<label for="backup-text">بيانات النسخة الاحتياطية</label><textarea id="backup-text" rows="12" readonly dir="ltr">' + esc(raw) + '</textarea>' +
+          '<div class="btns"><button class="btn line" data-act="close-sheet">إغلاق</button></div>');
+      }
+      return true;
+    } catch (e) { toast('تعذّر تنزيل النسخة الاحتياطية. جرّب من المتصفح.'); return false; }
+  }
+  function screenRecovery() {
+    return header('استرجاع البيانات') + '<section class="card"><h2>تعذّر فتح البيانات المحفوظة</h2>' +
+      '<p>لم نمسح بياناتك أو نستبدلها. احفظ نسخة منها قبل محاولة الاسترجاع.</p>' +
+      '<div class="btns"><button class="btn" data-act="export-recovery">حفظ البيانات الأصلية</button>' +
+      '<button class="btn line" data-act="restore-backup">استرجاع آخر نسخة سليمة</button></div>' +
+      '<label class="btn line" for="import-data">اختيار نسخة احتياطية</label><input id="import-data" type="file" accept=".json,application/json" data-import="1">' +
+      '<div class="btns"><button class="btn danger" data-act="reset">مسح البيانات والبدء من جديد</button></div></section>';
+  }
+  function previewImport(raw) {
+    try {
+      importDraft = E.normalizeState(JSON.parse(raw));
+      confirmSheet('استرجاع النسخة الاحتياطية؟', 'ستستبدل الخطة الحالية بنسخة تضم ' + E.plural(importDraft.subjects.length, 'مادة', 'مادتين', 'مواد', 'مادة') + '. ستُحفظ البيانات الحالية كنسخة سابقة قبل الاستبدال.', 'استرجاع النسخة', 'confirm-import');
+    } catch (e) { importDraft = null; toast('الملف لا يحتوي نسخة صالحة. لم تتغير بياناتك.'); }
   }
 
   /* ============ أدوات ============ */
@@ -92,11 +140,21 @@
 
   /* ============ الجدولة ============ */
   function replan(opts) {
+    if (storageBlocked) return null;
     var r = E.replan(S, now(), opts || {});
     S = r.state;
     save();
-    if (N) N.sync(S, now(), E);
+    syncNotifications();
     return r;
+  }
+  function syncNotifications() {
+    if (!N) return;
+    N.sync(S, now(), E).then(function (result) {
+      notifSync = result;
+      var el = document.getElementById('notif-lab');
+      if (el) el.innerHTML = notifText();
+      if (result && result.status === 'error') toast('تعذّر تحديث التذكيرات. أعد المحاولة من الإعدادات.');
+    }).catch(function () { notifSync = { status: 'error' }; toast('تعذّر تحديث التذكيرات. أعد المحاولة من الإعدادات.'); });
   }
   function failing() {
     var out = [];
@@ -137,6 +195,7 @@
 
   function render() {
     if (!S) return;
+    if (storageBlocked) { app.innerHTML = screenRecovery(); tabsEl.innerHTML = ''; document.body.className = 'no-tabs'; return; }
     var r = parseRoute(), html = '', tabs = true, tab = r.name;
     switch (r.name) {
       case 'welcome': html = screenWelcome(); tabs = false; break;
@@ -151,6 +210,7 @@
     var key = r.name + '/' + (r.arg || '');
     var y = key === lastRouteKey ? window.pageYOffset : 0;
     lastRouteKey = key;
+    if (memoryOnly) html = '<div class="card" role="alert"><p>تعذّر حفظ التغييرات على الجهاز. قد تضيع عند الإغلاق.</p><button class="btn line" data-act="export-data">تصدير نسخة احتياطية الآن</button></div>' + html;
     app.innerHTML = html;
     document.body.className = tabs ? '' : 'no-tabs';
     renderTabs(tab);
@@ -169,13 +229,20 @@
     return h + '</div>';
   }
 
+  function historicalSession(s, l) {
+    return !!(s.historyOnly || (l && l.archived) || (s.kind === 'review' && l && s.reviewCycle && (!l.review || s.reviewCycle !== l.review.cycle)));
+  }
   function sessionRow(s, n) {
     var sub = E.findSubject(S, s.subjectId), les = E.findLesson(sub, s.lessonId);
     if (!sub) return '';
     var day = E.parseDay(s.date);
     var title = les ? les.title : '';
     if (s.parts > 1) title += ' — الجزء ' + s.part + ' من ' + s.parts;
-    if (s.note) title = s.note + (les && les.title && les.title.indexOf('الدرس ') === 0 ? '' : (title ? ' · ' + title : ''));
+    var memo = s.note || (les && les.memo) || '';
+    if (memo) {
+      if (s.kind === 'review') title = memo + (title ? ' · ' + title : '');
+      else title = memo + (les && les.title && les.title.indexOf('الدرس ') === 0 ? '' : (title ? ' · ' + title : ''));
+    }
     var tags = '';
     if (s.kind === 'review') tags += '<span class="tag rev">مراجعة</span>';
     if (s.status === 'missed') tags += '<span class="tag late">فائتة</span>';
@@ -188,8 +255,8 @@
       '<div class="body" data-act="session" data-id="' + s.id + '" role="button" tabindex="0">' +
       '<div class="who"><span class="nm">' + esc(sub.name) + '</span>' + tags + '</div>' +
       '<div class="what">' + esc(title) + ' · ' + E.fmtDur(s.minutes) + '</div></div>' +
-      '<div class="tick">' + (s.status === 'missed'
-        ? '<span class="chk" aria-label="فائتة">' + icon('x') + '</span>'
+      '<div class="tick">' + (s.status === 'missed' || historicalSession(s, les)
+        ? '<span class="chk" aria-label="سجل محفوظ">' + icon(s.status === 'done' ? 'check' : 'x') + '</span>'
         : '<button class="chk" data-act="toggle" data-id="' + s.id + '" aria-label="' + (s.status === 'done' ? 'تراجع عن الإنجاز' : 'تمّت الجلسة') + '">' + icon('check') + '</button>') +
       '</div></div>';
   }
@@ -351,7 +418,7 @@
   }
   function previewDraft() {
     var n = now(), st = E.clone(S), sub;
-    if (E.parseDay(draft.deadline) <= n.day) return null;
+    if (!isFinite(E.parseDay(draft.deadline)) || E.parseDay(draft.deadline) <= n.day) return null;
     if (draft.id) { sub = E.findSubject(st, draft.id); E.updateSubject(sub, draftInput(), n.day); }
     else { sub = E.createSubject(draftInput(), n.day); sub.id = '__preview'; st.subjects.push(sub); }
     return E.analyze(st, n).subjects[sub.id];
@@ -437,7 +504,7 @@
   function saveSubject() {
     var d = draft, n = now(), errs = {};
     if (!d.name.trim()) errs.name = 'اكتب اسم المادة';
-    if (E.parseDay(d.deadline) <= n.day) errs.deadline = 'اختر موعداً بعد اليوم';
+    if (!isFinite(E.parseDay(d.deadline)) || E.parseDay(d.deadline) <= n.day) errs.deadline = 'اختر موعداً صالحاً بعد اليوم';
     if (!d.id && d.backlog === 0 && (d.mode === 'self' || d.teacherPerWeek === 0)) errs.backlog = 'أضف درساً واحداً على الأقل';
     d.errors = errs;
     if (Object.keys(errs).length) { render(); return; }
@@ -591,13 +658,23 @@
       '<div class="setrow"><div class="lab" id="notif-lab">' + notifText() + '</div><button class="btn small ghost" data-act="notif">تفعيل</button></div></section>';
     h += '<h2 class="sec">الجدول</h2><div class="btns" style="margin-top:0"><button class="btn ghost" data-act="replan-now">إعادة الجدولة الآن</button></div>' +
       '<p class="note">التطبيق يعيد توزيع ما فاتك تلقائياً كل يوم، وهذا الزر للتحديث الفوري.</p>';
-    h += '<h2 class="sec">البيانات</h2><div class="btns" style="margin-top:0"><button class="btn danger" data-act="reset">مسح كل البيانات</button></div>' +
-      '<p class="note">بياناتك كلها على جوالك ولا تُرسل لأي جهة. عند مسحها لا يمكن استرجاعها.<br>الإصدار 0.1 (تجريبي)</p>';
+    h += '<h2 class="sec">البيانات</h2><div class="btns"><button class="btn line" data-act="export-data">تصدير نسخة احتياطية</button>' +
+      '<button class="btn line" data-act="restore-backup">استرجاع النسخة السابقة</button><button class="btn line" data-act="export-recovery">تصدير بيانات قبل الاسترجاع</button></div>' +
+      '<label for="import-data">استيراد نسخة احتياطية</label><input id="import-data" type="file" accept=".json,application/json" data-import="1">';
+    h += '<p class="note">احفظ نسخة خارج التطبيق قبل حذفه أو مسح بياناته. استرجاع النسخة يستبدل الخطة الحالية بعد التأكيد.</p>';
+    h += '<div class="btns" style="margin-top:0"><button class="btn danger" data-act="reset">مسح كل البيانات</button></div>' +
+      '<p class="note">بياناتك كلها على جوالك ولا تُرسل لأي جهة. عند مسحها لا يمكن استرجاعها.<br>الإصدار ' + APP_VERSION + ' (تجريبي)</p>';
     return h;
   }
   function notifText() {
     if (notifStatus === 'unavailable' || notifStatus == null) return 'الإشعارات<small>تعمل داخل تطبيق أندرويد فقط</small>';
-    if (notifStatus === 'granted') return 'الإشعارات مفعّلة<small>سيصلك تنبيه قبل كل جلسة</small>';
+    if (notifStatus === 'granted') {
+      if (notifSync && notifSync.status === 'error') return 'مسموح بالإشعارات<small>تعذّر تحديث التذكيرات. اضغط تفعيل للمحاولة مجدداً.</small>';
+      if (notifSync && notifSync.status === 'scheduled') return 'جُدولت التذكيرات<small>افتح التطبيق دورياً لتجديدها. تُجدول أول 60 جلسة خلال أسبوع من اليوم، وقد يتأثر وصولها بإعدادات النظام.</small>';
+      if (notifSync && notifSync.status === 'disabled') return 'الإشعارات مسموحة<small>التذكير قبل الجلسة متوقف.</small>';
+      if (notifSync && notifSync.status === 'empty') return 'الإشعارات مسموحة<small>لا تذكيرات قادمة ضمن نافذة الجدولة.</small>';
+      return 'مسموح بالإشعارات<small>لم نتأكد بعد من جدولة التذكيرات.</small>';
+    }
     return 'الإشعارات غير مفعّلة<small>فعّلها ليصلك تنبيه قبل كل جلسة</small>';
   }
   function refreshNotifStatus() {
@@ -618,20 +695,25 @@
   }
 
   /* ============ الأوراق السفلية ============ */
-  var sheetOpen = false, skipPop = 0;
+  var sheetOpen = false, skipPop = 0, afterSheetPath = null;
   function openSheet(html) {
     toastEl.className = '';
     sheetRoot.innerHTML = '<div class="backdrop" data-act="close-sheet"></div><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>' + html + '</div>';
     if (!sheetOpen) { sheetOpen = true; try { history.pushState({ sheet: 1 }, ''); } catch (e) { /* ignore */ } }
   }
-  function closeSheet() {
-    if (!sheetOpen) return;
+  function closeSheet(nextPath) {
+    if (!sheetOpen) { if (typeof nextPath === 'string') goReplace(nextPath); return; }
+    if (typeof nextPath === 'string') afterSheetPath = nextPath;
     sheetRoot.innerHTML = '';
     sheetOpen = false; skipPop++;
-    try { history.back(); } catch (e) { skipPop = 0; }
+    try { history.back(); } catch (e) { skipPop = 0; if (afterSheetPath) { var path = afterSheetPath; afterSheetPath = null; goReplace(path); } }
   }
   window.addEventListener('popstate', function () {
-    if (skipPop > 0) { skipPop--; return; }
+    if (skipPop > 0) {
+      skipPop--;
+      if (afterSheetPath) { var path = afterSheetPath; afterSheetPath = null; goReplace(path); render(); }
+      return;
+    }
     if (sheetOpen) { sheetRoot.innerHTML = ''; sheetOpen = false; }
   });
 
@@ -640,8 +722,10 @@
     var sub = E.findSubject(S, s.subjectId), les = E.findLesson(sub, s.lessonId), n = now();
     var h = '<h3>' + esc(sub.name) + (s.kind === 'review' ? ' — مراجعة' : '') + '</h3><p class="lead">' + esc(les ? les.title : '') +
       (s.parts > 1 ? ' — الجزء ' + s.part + ' من ' + s.parts : '') + '<br>' + E.relDay(E.parseDay(s.date), n.day) + ' · ' + E.fmtTime(s.start) + ' حتى ' + E.fmtTime(s.start + s.minutes) + ' · ' + E.fmtDur(s.minutes) + '</p>';
-    if (s.note) h += '<div class="note-box"><b>ما دُرس</b><p>' + esc(s.note) + '</p></div>';
-    if (s.status === 'pending') {
+    var memoShow = s.note || (les && les.memo);
+    if (memoShow) h += '<div class="note-box"><b>للحفظ والمراجعة</b><p>' + esc(memoShow) + '</p></div>';
+    if (historicalSession(s, les)) { h += '<p class="note">جلسة محفوظة في السجل فقط، ولا تغيّر الخطة الحالية.</p>'; }
+    else if (s.status === 'pending') {
       h += '<button class="btn block" data-act="toggle" data-id="' + id + '">تمّت الجلسة</button>' +
         '<div class="btns" style="margin-top:10px"><button class="btn line block" data-act="skip" data-id="' + id + '">لن أدرسها، أعد توزيعها</button></div>';
     } else if (s.status === 'done') {
@@ -654,7 +738,7 @@
     var s = E.findSession(S, sessionId);
     if (!s) return;
     var sub = E.findSubject(S, s.subjectId), les = E.findLesson(sub, s.lessonId);
-    sheetDraft = { sessionId: sessionId, note: s.note || '', followUp: followUp || null, rename: false };
+    sheetDraft = { sessionId: sessionId, note: s.note || (les && les.memo) || '', followUp: followUp || null, rename: false };
     var h = '<h3 class="fancy">ماذا تريد أن تراجع أو تحفظ لاحقاً؟</h3>' +
       '<p class="lead soft">اكتب ما تود العودة إليه لاحقاً، ليظهر مع الجلسة وقت المراجعة.</p>' +
       '<div class="field" style="margin-top:4px"><label for="s-note">للتراجع لاحقاً</label>' +
@@ -671,6 +755,11 @@
 
   function difficultySheet(subjectId, lessonId) {
     var sub = E.findSubject(S, subjectId), les = E.findLesson(sub, lessonId);
+    if (!les) return;
+    if (!les.difficulty) {
+      E.setDifficulty(S, subjectId, lessonId, 'medium');
+      replan();
+    }
     var h = '<h3>أنهيت ' + esc(les.title) + '</h3><p class="lead">كيف كان الدرس؟ يحدد هذا مدة مراجعته.</p><div class="diffs">';
     [['easy', 'سهل', S.settings.reviewEasyMin], ['medium', 'متوسط', S.settings.reviewEasyMin], ['hard', 'صعب', S.settings.reviewHardMin]].forEach(function (d) {
       h += '<button class="opt' + (les.difficulty === d[0] ? ' rec' : '') + '" data-act="difficulty" data-sid="' + subjectId + '" data-id="' + lessonId + '" data-diff="' + d[0] + '"><b>' + d[1] + '</b><span>مراجعة ' + E.fmtDur(d[2]) + '</span></button>';
@@ -680,7 +769,7 @@
 
   function lessonSheet(subjectId, lessonId) {
     var sub = E.findSubject(S, subjectId), l = E.findLesson(sub, lessonId); if (!l) return;
-    sheetDraft = { sid: subjectId, id: lessonId, title: l.title, min: l.min };
+    sheetDraft = { sid: subjectId, id: lessonId, title: l.title, min: l.min, minAllowed: Math.max(15, l.doneMin || 0) };
     var h = '<h3>' + esc(sub.name) + '</h3>' +
       '<div class="field" style="margin-top:8px"><label for="l-title">اسم الدرس</label><input id="l-title" type="text" data-bind-sheet="title" value="' + esc(l.title) + '" maxlength="60"></div>';
     if (!l.done) {
@@ -699,7 +788,7 @@
     openSheet(h);
   }
   function lessonStepper(v) {
-    return '<div class="stepper" id="l-stepper"><button type="button" data-act="lstep" data-dir="-1" aria-label="إنقاص"' + (v <= 15 ? ' disabled' : '') + '>−</button><output>' + E.fmtDur(v) + '</output><button type="button" data-act="lstep" data-dir="1" aria-label="زيادة"' + (v >= 360 ? ' disabled' : '') + '>+</button></div>';
+    return '<div class="stepper" id="l-stepper"><button type="button" data-act="lstep" data-dir="-1" aria-label="إنقاص"' + (v <= (sheetDraft && sheetDraft.minAllowed || 15) ? ' disabled' : '') + '>−</button><output>' + E.fmtDur(v) + '</output><button type="button" data-act="lstep" data-dir="1" aria-label="زيادة"' + (v >= 360 ? ' disabled' : '') + '>+</button></div>';
   }
 
   function openOptions() {
@@ -760,24 +849,22 @@
     toggle: function (el) {
       var id = el.getAttribute('data-id'), s = E.findSession(S, id);
       if (!s || s.status === 'missed') return;
-      if (sheetOpen) closeSheet();
-      if (s.status === 'done') { E.undoSession(S, id); save(); render(); return; }
+      if (s.status === 'done') { if (sheetOpen) closeSheet(); E.undoSession(S, id); replan(); render(); return; }
       var wasStudy = s.kind === 'study';
       var res = E.completeSession(S, id, now());
+      replan();
+      render();
       if (res.lessonCompleted) {
-        E.setDifficulty(S, res.subjectId, res.lessonId, 'medium');
-        replan();
-        render();
         if (wasStudy) {
           studyNoteSheet(id, { type: 'difficulty', subjectId: res.subjectId, lessonId: res.lessonId });
         } else {
           difficultySheet(res.subjectId, res.lessonId);
         }
       } else if (wasStudy) {
-        save(); render();
         studyNoteSheet(id, null);
       } else {
-        save(); render(); toast('أحسنت، سُجّلت الجلسة');
+        if (sheetOpen) closeSheet();
+        toast('أحسنت، سُجّلت الجلسة');
       }
     },
     'toggle-rename': function (el) {
@@ -787,31 +874,32 @@
       if (!sheetDraft || !sheetDraft.sessionId) { closeSheet(); return; }
       var s = E.findSession(S, sheetDraft.sessionId);
       var noteEl = document.getElementById('s-note');
-      var note = String((noteEl && noteEl.value) || sheetDraft.note || '').trim();
+      var note = String(noteEl ? noteEl.value : (sheetDraft.note || '')).trim();
       var follow = sheetDraft.followUp;
       var renEl = document.getElementById('s-rename');
       var rename = renEl ? !!renEl.checked : !!sheetDraft.rename;
       if (s) {
         if (note) s.note = note;
         else delete s.note;
-        if (rename && note) {
-          var sub = E.findSubject(S, s.subjectId), les = E.findLesson(sub, s.lessonId);
-          if (les) les.title = note.slice(0, 60);
+        var sub = E.findSubject(S, s.subjectId), les = E.findLesson(sub, s.lessonId);
+        if (les) {
+          if (note) les.memo = note; else delete les.memo;
+          les.customized = true;
+          if (rename && note) les.title = note.slice(0, 60);
         }
       }
-      closeSheet();
-      save(); render();
+      save(); syncNotifications(); render();
       if (follow && follow.type === 'difficulty') {
         difficultySheet(follow.subjectId, follow.lessonId);
       } else {
-        toast(note ? 'سُجّل موضوع الجلسة' : 'أحسنت، سُجّلت الجلسة');
+        closeSheet();
+        toast(note ? 'سُجّل للحفظ والمراجعة' : 'أحسنت، سُجّلت الجلسة');
       }
     },
     'skip-note': function () {
       var follow = sheetDraft && sheetDraft.followUp;
-      closeSheet();
       if (follow && follow.type === 'difficulty') difficultySheet(follow.subjectId, follow.lessonId);
-      else toast('أحسنت، سُجّلت الجلسة');
+      else { closeSheet(); toast('أحسنت، سُجّلت الجلسة'); }
     },
     session: function (el) { sessionSheet(el.getAttribute('data-id')); },
     skip: function (el) {
@@ -827,7 +915,6 @@
       toast('أضفت مراجعة ' + E.fmtDur(diff === 'hard' ? S.settings.reviewHardMin : S.settings.reviewEasyMin) + ' لهذا الدرس');
     },
     'replan-now': function () {
-      if (sheetOpen) closeSheet();
       var r = replan({ forceToday: true });
       render(); resultSheet(r);
     },
@@ -873,7 +960,7 @@
       var id = el.getAttribute('data-id');
       S.subjects = S.subjects.filter(function (s) { return s.id !== id; });
       S.sessions = S.sessions.filter(function (s) { return s.subjectId !== id; });
-      closeSheet(); replan(); goReplace('subjects'); render(); toast('حُذفت المادة');
+      closeSheet('subjects'); replan(); render(); toast('حُذفت المادة');
     },
 
     /* الدروس */
@@ -881,11 +968,11 @@
     'lesson-toggle': function (el) {
       var sid = el.getAttribute('data-sid'), id = el.getAttribute('data-id');
       var sub = E.findSubject(S, sid), l = E.findLesson(sub, id);
-      if (el.getAttribute('data-close')) closeSheet();
+      if (el.getAttribute('data-close') && l.done) closeSheet();
       if (l.done) { E.setLessonDone(S, sid, id, false, now()); replan(); render(); return; }
       E.setLessonDone(S, sid, id, true, now());
-      E.setDifficulty(S, sid, id, 'medium');
-      replan(); render(); difficultySheet(sid, id);
+      replan(); render();
+      difficultySheet(sid, id);
     },
     'add-lesson': function (el) {
       var sub = E.findSubject(S, el.getAttribute('data-id'));
@@ -893,19 +980,24 @@
       replan(); render(); toast('أضفت درساً جديداً');
     },
     lstep: function (el) {
-      sheetDraft.min = clamp(sheetDraft.min + (+el.getAttribute('data-dir')) * 15, 15, 360);
+      sheetDraft.min = clamp(sheetDraft.min + (+el.getAttribute('data-dir')) * 15, sheetDraft.minAllowed || 15, 360);
       var w = document.getElementById('l-stepper');
       if (w) { var tmp = document.createElement('div'); tmp.innerHTML = lessonStepper(sheetDraft.min); w.parentNode.replaceChild(tmp.firstChild, w); }
     },
     'lesson-save': function () {
       var sub = E.findSubject(S, sheetDraft.sid), l = E.findLesson(sub, sheetDraft.id);
-      if (sheetDraft.title.trim()) l.title = sheetDraft.title.trim();
-      if (!l.done) l.min = sheetDraft.min;
+      if (!l.done && !E.setLessonDuration(S, sub.id, l.id, sheetDraft.min)) { toast('لا يمكن تقليل مدة الدرس عن الوقت الذي أنجزته.'); return; }
+      if (sheetDraft.title.trim()) { l.title = sheetDraft.title.trim(); l.customized = true; }
       closeSheet(); replan(); render(); toast('تم الحفظ');
     },
     'lesson-delete': function (el) {
+      var sub = E.findSubject(S, el.getAttribute('data-sid')), l = E.findLesson(sub, el.getAttribute('data-id'));
+      if (!l || l.archived) return;
+      confirmSheet('حذف ' + l.title + ' من الخطة؟', 'تُلغى جلساته القادمة، ويُحفظ ما أنجزته في السجل والتقارير.', 'حذف من الخطة', 'do-lesson-delete', 'data-sid="' + sub.id + '" data-id="' + l.id + '"');
+    },
+    'do-lesson-delete': function (el) {
       var sub = E.findSubject(S, el.getAttribute('data-sid'));
-      sub.lessons = sub.lessons.filter(function (l) { return l.id !== el.getAttribute('data-id'); });
+      E.deleteLesson(S, sub.id, el.getAttribute('data-id'));
       closeSheet(); replan(); render(); toast('حُذف الدرس');
     },
     'request-review': function (el) {
@@ -936,21 +1028,43 @@
       N.request().then(function (s) {
         notifStatus = s;
         if (s === 'granted') {
-          N.sync(S, now(), E);
-          N.exactStatus().then(function (x) { if (x !== 'granted') { toast('اسمح بالتنبيهات الدقيقة لتصل في موعدها'); N.openExactSettings(); } else toast('فُعّلت الإشعارات'); });
+          syncNotifications();
+          N.exactStatus().then(function (x) { if (x === 'denied' || x === 'prompt') { toast('اسمح بالتنبيهات الدقيقة لتصل في موعدها'); N.openExactSettings().then(function (opened) { if (!opened) toast('تعذّر فتح إعدادات المنبهات. افتحها من إعدادات الهاتف.'); }); } else if (x === 'granted') toast('سُمح بالإشعارات. يجري تحديث التذكيرات.'); else toast('تعذّر التحقق من المنبهات الدقيقة. راجع إعدادات الهاتف.'); });
         } else toast('لم يُسمح بالإشعارات، فعّلها من إعدادات الجوال');
         var el = document.getElementById('notif-lab'); if (el) el.innerHTML = notifText();
       });
     },
+    'export-data': function () { downloadJSON(JSON.stringify(S, null, 2), 'bacplanner-backup-' + E.fmtDay(now().day) + '.json'); },
+    'export-recovery': function () {
+      try { var raw = recoveryRaw || localStorage.getItem(RECOVERY_KEY); if (raw) downloadJSON(raw, 'bacplanner-original-data.json'); else toast('لا توجد بيانات قديمة محفوظة للاسترجاع.'); }
+      catch (e) { toast('تعذّر قراءة بيانات الاسترجاع.'); }
+    },
+    'restore-backup': function () {
+      try { var raw = localStorage.getItem(BACKUP_KEY); if (raw) previewImport(raw); else toast('لا توجد نسخة سابقة محفوظة.'); }
+      catch (e) { toast('تعذّر قراءة النسخة السابقة.'); }
+    },
+    'confirm-import': function () {
+      if (!importDraft) return;
+      var previous = S, blocked = storageBlocked;
+      S = importDraft; storageBlocked = false;
+      if (!save()) { S = previous; storageBlocked = blocked; return; }
+      importDraft = null; recoveryRaw = null; draft = null;
+      closeSheet('today'); replan(); render(); toast('استُرجعت النسخة وأُعيد ترتيب الجلسات المتبقية.');
+    },
     reset: function () { confirmSheet('مسح كل البيانات؟', 'تُحذف موادك ودروسك وجلساتك وإعداداتك من هذا الجهاز.', 'مسح كل شيء', 'do-reset'); },
     'do-reset': function () {
-      closeSheet(); S = E.newState(); draft = null; save(); goReplace('welcome'); render();
+      var oldState = S, wasBlocked = storageBlocked;
+      storageBlocked = false; S = E.newState();
+      if (!save()) { S = oldState; storageBlocked = wasBlocked; return; }
+      try { localStorage.removeItem(BACKUP_KEY); localStorage.removeItem(RECOVERY_KEY); } catch (e) { toast('مُسحت الخطة، لكن تعذّر مسح النسخة السابقة من التخزين.'); }
+      closeSheet('welcome'); recoveryRaw = null; draft = null; syncNotifications(); render();
     }
   };
 
   document.addEventListener('click', function (ev) {
     var el = ev.target.closest ? ev.target.closest('[data-act]') : null;
     if (!el) return;
+    if (storageBlocked && ['export-recovery','restore-backup','confirm-import','reset','do-reset','close-sheet'].indexOf(el.getAttribute('data-act')) === -1) return;
     var fn = A[el.getAttribute('data-act')];
     if (fn) fn(el, ev);
   });
@@ -972,13 +1086,22 @@
     }
   });
   document.addEventListener('change', function (ev) {
+    if (ev.target.getAttribute && ev.target.getAttribute('data-import')) {
+      var file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      if (file.size > 5 * 1024 * 1024) { toast('الملف أكبر من الحد المسموح: 5 ميغابايت.'); ev.target.value = ''; return; }
+      var reader = new FileReader();
+      reader.onload = function () { previewImport(String(reader.result)); };
+      reader.onerror = function () { toast('تعذّرت قراءة الملف. لم تتغير بياناتك.'); };
+      reader.readAsText(file); ev.target.value = ''; return;
+    }
     if (ev.target.getAttribute && ev.target.getAttribute('data-bind-set') === 'startMin') { replan(); render(); }
   });
 
   /* ============ الإقلاع والتحديث الدوري ============ */
   function tick(showResult) {
     var n = now();
-    if (!S.subjects.length) return;
+    if (storageBlocked || !S.subjects.length) return;
     if (E.needsReplan(S, n)) {
       var r = replan();
       if (showResult && (r.diff.missed || r.diff.moved.length)) { render(); resultSheet(r); return; }
@@ -1001,7 +1124,7 @@
       var r = parseRoute();
       if (r.name === 'today' || !r.name) { tick(false); render(); }
     }, 60000);
-    if (N) N.sync(S, now(), E);
+    if (!storageBlocked) syncNotifications();
   }
 
   window.__bac = { get state() { return S; } };   // لأغراض الاختبار فقط

@@ -30,7 +30,16 @@ jobs:
           packages: platform-tools
 
       - name: Install npm dependencies
-        run: npm install
+        run: npm ci
+
+      - name: Test engine and saved data
+        run: npm test
+
+      - name: Prepare test browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Test browser workflow
+        run: npm run test:ui
 
       - name: Setup Python (for icons)
         uses: actions/setup-python@v5

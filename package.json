@@ -1,13 +1,18 @@
 {
   "name": "bacplanner",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "private": true,
   "description": "مخطط البكالوريا — تطبيق تخطيط الدراسة للبكالوريا",
   "scripts": {
-    "test": "node --test tests/engine.test.js",
-    "sync": "npx cap sync",
+    "test": "node --test tests/engine.test.js tests/regression.test.js tests/notify.test.js tests/project.test.js tests/policies.test.js",
+    "sync": "node scripts/sync-version.js && npx cap sync",
     "android:add": "npx cap add android",
-    "android:open": "npx cap open android"
+    "android:open": "npx cap open android",
+    "test:ui": "node --test tests/ui.test.js",
+    "version:sync": "node scripts/sync-version.js",
+    "pretest": "node scripts/sync-version.js",
+    "preversion": "npm test",
+    "version": "node scripts/sync-version.js"
   },
   "dependencies": {
     "@capacitor/android": "8.6.2",
@@ -15,6 +20,7 @@
     "@capacitor/local-notifications": "8.3.1"
   },
   "devDependencies": {
-    "@capacitor/cli": "8.6.2"
+    "@capacitor/cli": "8.6.2",
+    "playwright": "1.58.2"
   }
 }
